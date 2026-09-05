@@ -1,0 +1,6 @@
+# Keep LF everywhere: this repo's tooling and encoding rules assume LF-only,
+# BOM-less UTF-8 source files (see AGENTS.md Rule #1).
+* text=auto eol=lf
+*.png binary
+*.ico binary
+*.ttf binary

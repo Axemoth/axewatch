@@ -1,0 +1,39 @@
+services:
+  backend:
+    build: ./backend
+    container_name: axewatch-backend
+    restart: unless-stopped
+    environment:
+      - AXEWATCH_DB=/data/axewatch.db
+      - AXEWATCH_ORIGINS=${AXEWATCH_ORIGINS:-http://localhost:5173,http://localhost}
+    volumes:
+      - axewatch-data:/data
+    expose:
+      - "8000"
+
+  frontend:
+    build: ./frontend
+    container_name: axewatch-frontend
+    restart: unless-stopped
+    depends_on:
+      - backend
+    ports:
+      - "${AXEWATCH_PORT:-3000}:80"
+
+  # Optional public access via your own domain (free Cloudflare Tunnel).
+  # Off by default — plain `docker compose up` is unaffected.
+  # Enable with:  CLOUDFLARE_TUNNEL_TOKEN=<token> docker compose --profile tunnel up -d
+  # (token comes from Cloudflare Zero Trust → Networks → Tunnels; the public
+  # hostname there must point at Service http://frontend:80).
+  tunnel:
+    image: cloudflare/cloudflared:latest
+    container_name: axewatch-tunnel
+    restart: unless-stopped
+    depends_on:
+      - frontend
+    command: tunnel --no-autoupdate run --token ${CLOUDFLARE_TUNNEL_TOKEN:-missing}
+    profiles: ["tunnel"]
+    # No ports: outbound-only connection, nothing listens publicly.
+
+volumes:
+  axewatch-data:

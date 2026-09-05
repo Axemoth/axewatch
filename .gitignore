@@ -1,0 +1,49 @@
+# dependencies (reinstall with npm ci / pip install -r)
+node_modules/
+frontend/node_modules/
+
+# build output
+frontend/dist/
+dist/
+build/
+
+# LIVE USER DATABASES — holdings, PAN vault, paper trades, signal history.
+# These live in Docker named volumes in production; this catches stray local copies.
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+*.sqlite
+*.sqlite3
+
+# secrets and local environment (tokens, ports, origins)
+.env
+.env.*
+
+# local debug snapshots — may embed real portfolio/market data
+/mfd.json
+/mfs.json
+/outlook.json
+/sum_tmp.json
+*-tmp.json
+*.local.json
+
+# dev screenshots — may show personal portfolio screenshots
+shot-*.png
+verify-*.png
+
+# python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+
+# typescript build cache
+*.tsbuildinfo
+
+# OS / editors / logs
+.DS_Store
+Thumbs.db
+.vscode/
+*.log
