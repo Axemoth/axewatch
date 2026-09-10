@@ -16,6 +16,7 @@ import {
   fetchSubscription,
   fetchSubscriptionHistory,
   fetchUpcomingIpos,
+  lookupNormMap,
   normIpoName,
   type IpoRow,
   type PastIpoRow,
@@ -88,7 +89,7 @@ export function useGmpMap(): Map<string, GmpSpot> {
 }
 
 export function GmpCell({ name, gmpMap }: { name?: string | null; gmpMap: Map<string, GmpSpot> }) {
-  const spot = gmpMap.get(normIpoName(name));
+  const spot = lookupNormMap(gmpMap, name);
   if (!spot || spot.gmp == null)
     return <span className="text-zinc-600">—</span>;
   const delta = spot.first != null ? spot.gmp - spot.first : null;

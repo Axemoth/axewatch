@@ -84,6 +84,7 @@ class NSESession:
                 if "json" not in r.headers.get("content-type", ""):
                     raise ValueError(f"non-JSON content-type for {url}")
                 health.record("nse", ok=True, latency=time.time() - t0, status=200)
+                r.encoding = "utf-8"  # NSE omits charset; requests would guess
                 return r.json()
             except Exception as exc:
                 last_exc = exc

@@ -129,9 +129,9 @@ export interface PastIpoSub {
  *  "TEMPSENS INSTRUMENTS (INDIA) LIMITED") and GMP tracker names
  *  ("Augmont EnterprisesOPEN"). Strips corporate suffixes and glued-on status
  *  words, then compares the bare core. Applied to BOTH sides, so stripping
- *  is consistent even when it over-trims. */
+ *  is consistent even when it over-trims. Mirrors backend canon_ipo_name. */
 export function normIpoName(name?: string | null): string {
-  let s = (name ?? "").toLowerCase().replace(/[^a-z0-9]/g, "");
+  let s = (name ?? "").toLowerCase().replace(/&/g, " and ").replace(/[^a-z0-9]/g, "");
   for (let i = 0; i < 4; i++) {
     const before = s;
     s = s
@@ -140,6 +140,31 @@ export function normIpoName(name?: string | null): string {
     if (s === before) break;
   }
   return s;
+}
+
+/** Lenient IPO-name match for NSE's truncated names ("Gaja Alternative" vs
+ *  "Gaja Alternative Asset Management"). Exact norm match first; otherwise a
+ *  containment that needs at least 10 shared characters to avoid collisions
+ *  on short names. */
+export function ipoNamesMatch(a?: string | null, b?: string | null): boolean {
+  const na = normIpoName(a);
+  const nb = normIpoName(b);
+  if (!na || !nb) return false;
+  if (na === nb) return true;
+  const short = na.length < nb.length ? na : nb;
+  const long = na.length < nb.length ? nb : na;
+  return short.length >= 10 && long.includes(short);
+}
+
+/** Map lookup with the same lenient fallback (for pre-indexed norm maps). */
+export function lookupNormMap<T>(map: Map<string, T>, name?: string | null): T | undefined {
+  const key = normIpoName(name);
+  const exact = map.get(key);
+  if (exact !== undefined || !key) return exact;
+  for (const [k, v] of map) {
+    if (k.length >= 10 && key.length >= 10 && (k.includes(key) || key.includes(k))) return v;
+  }
+  return undefined;
 }
 
 export interface GmpTrendSeries {

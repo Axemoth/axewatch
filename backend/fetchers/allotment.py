@@ -23,6 +23,7 @@ mask_pan() anywhere a PAN could surface.
 from __future__ import annotations
 
 import base64
+import html
 import json
 import logging
 import os
@@ -77,7 +78,7 @@ def canon_ipo_name(name: str | None) -> str:
     """Join key between NSE/MUFG/KFintech issue names. Mirrors the frontend
     normIpoName: concatenate alphanumerics, then strip corporate suffixes,
     country tags and glued status words from the tail."""
-    s = re.sub(r"[^a-z0-9]", "", (name or "").lower())
+    s = re.sub(r"[^a-z0-9]", "", (name or "").lower().replace("&", " and "))
     for _ in range(4):
         before = s
         s = re.sub(r"(open|closed|upcoming|listed|live|active|forthcoming)$", "", s)
@@ -172,6 +173,56 @@ def directory_if_warm() -> dict | None:
     return None
 
 
+_IPOMARKET_URL = "https://ipomarket.in/allotment"
+
+
+def _ipomarket_registrar_key(text: str) -> str | None:
+    t = (text or "").lower()
+    if "mufg" in t or "link intime" in t or "linkintime" in t:
+        return "mufg"
+    if "kfin" in t:
+        return "kfin"
+    if "bigshare" in t or "big share" in t:
+        return "bigshare"
+    if "skyline" in t:
+        return "skyline"
+    if "cameo" in t:
+        return "cameo"
+    if "purva" in t:
+        return "purva"
+    if "maashitla" in t:
+        return "maashitla"
+    if "beetal" in t:
+        return "beetal"
+    return None
+
+
+def _ipomarket_allotments() -> list[dict]:
+    """[(name, allotment_date, registrar)] from ipomarket's allotment tables.
+
+    This is the only public source that maps CURRENT issues to KFintech and
+    the smaller SME registrars (their own pages expose no company list).
+    Directory-grade data, not personal data; failures are tolerated.
+    """
+    r = requests.get(_IPOMARKET_URL, headers={"User-Agent": MUFG_UA}, timeout=30)
+    r.raise_for_status()
+    r.encoding = "utf-8"
+    out = []
+    for section in re.split(r"<h3[^>]*>", r.text)[1:]:
+        m = re.search(r"<table[^>]*>(.*?)</table>", section, re.S | re.I)
+        if not m:
+            continue
+        for row in re.findall(r"<tr[^>]*>(.*?)</tr>", m.group(1), re.S | re.I):
+            cells = [re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", "", c))).strip()
+                     for c in re.findall(r"<t[dh][^>]*>(.*?)</t[dh]>", row, re.S | re.I)]
+            cells = [c for c in cells if c]
+            if len(cells) >= 3 and "company" not in cells[0].lower():
+                key = _ipomarket_registrar_key(cells[2])
+                if key:
+                    out.append({"name": cells[0], "allotment_date": cells[1], "registrar": key})
+    return out
+
+
 def _bigshare_companies(url: str) -> list[dict]:
     r = requests.get(url, headers={"User-Agent": MUFG_UA}, timeout=25)
     r.raise_for_status()
@@ -188,11 +239,13 @@ def _bigshare_companies(url: str) -> list[dict]:
 
 
 def registrar_directory(force: bool = False) -> dict:
-    """canon_name -> {"registrar": "mufg"|"bigshare", "name": display name}.
+    """canon_name -> {"registrar", "name", "allotment_date"?}.
 
-    MUFG from their live company API; Bigshare from the public dropdowns on
-    all three mirror servers. Cached 24h; individual source failures are
-    tolerated (attribution just gets sparser, checks still run).
+    MUFG from their live company API and Bigshare from the public dropdowns
+    are authoritative; ipomarket's allotment tables fill the rest (notably
+    KFintech and the smaller SME registrars, which publish no company list)
+    and backfill declared allotment dates. Cached 24h; individual source
+    failures are tolerated (attribution just gets sparser, checks still run).
     """
     global _REGDIR
     ts, cached = _REGDIR
@@ -220,13 +273,31 @@ def registrar_directory(force: bool = False) -> dict:
         except Exception as exc:
             health.record("allot_regdir", ok=False, latency=0.0, error=exc)
             logger.warning("registrar directory %s failed: %s", url, exc)
+    try:
+        _pace("allot_regdir", gap=1.0)
+        t0 = time.time()
+        for e in _ipomarket_allotments():
+            key = canon_ipo_name(e["name"])
+            if not key:
+                continue
+            if key not in directory:
+                directory[key] = {"registrar": e["registrar"], "name": e["name"],
+                                  "allotment_date": e["allotment_date"]}
+            elif e["allotment_date"] and not directory[key].get("allotment_date"):
+                directory[key]["allotment_date"] = e["allotment_date"]
+        health.record("allot_regdir", ok=True, latency=time.time() - t0)
+    except Exception as exc:
+        health.record("allot_regdir", ok=False, latency=0.0, error=exc)
+        logger.warning("registrar directory ipomarket failed: %s", exc)
     # Do not turn a temporary upstream outage into a 24-hour blind spot.  An
     # empty directory means neither live source could be read, so let the next
     # request try again; a partial directory is still useful and is cached.
     if directory:
         _REGDIR = (time.time(), directory)
-    logger.info("registrar directory: %d issues (%d bigshare)",
-                len(directory), sum(1 for v in directory.values() if v["registrar"] == "bigshare"))
+    by_reg: dict[str, int] = {}
+    for v in directory.values():
+        by_reg[v["registrar"]] = by_reg.get(v["registrar"], 0) + 1
+    logger.info("registrar directory: %d issues %s", len(directory), by_reg)
     return directory
 
 
@@ -357,57 +428,91 @@ def _mufg_token(session: requests.Session) -> str:
     return base64.b64encode(cipher.encrypt(pad(token.encode(), 16))).decode()
 
 
-def mufg_check(pan: str, company_id: str, company_name: str = "") -> dict:
-    """PAN allotment at MUFG for one company. found=False == no record."""
+def mufg_session() -> requests.Session:
+    """One warmed session per PAN-run: landing page once, then token+search
+    per company. Fewer requests than a fresh session per lookup, and warm
+    cookies fail less often than cold ones."""
+    s = requests.Session()
+    s.headers.update({"User-Agent": MUFG_UA, "Referer": MUFG_BASE + "public-issues.html"})
+    s.get(MUFG_BASE + "public-issues.html", timeout=20)
+    return s
+
+
+def _is_throttle_message(msg: str) -> bool:
+    m = msg.lower()
+    return "429" in m or "503" in m or "throttled" in m or "cooling down" in m
+
+
+def mufg_check(pan: str, company_id: str, company_name: str = "",
+               session: requests.Session | None = None) -> dict:
+    """PAN allotment at MUFG for one company. found=False == no record.
+
+    Retries ONCE on transport blips (connection reset, timeout, 5xx) — never
+    on throttle responses (429/503), which surface immediately so the health
+    breaker can cool the source down. Same request budget either way.
+    """
     pan = pan.strip().upper()
     _pace("allot_mufg")
     t0 = time.time()
-    try:
-        s = requests.Session()
-        s.headers.update({"User-Agent": MUFG_UA, "Referer": MUFG_BASE + "public-issues.html"})
-        s.get(MUFG_BASE + "public-issues.html", timeout=20)
-        token = _mufg_token(s)
-        r = s.post(
-            MUFG_BASE + "IPO.aspx/SearchOnPan",
-            json={"clientid": company_id, "PAN": pan, "IFSC": "", "CHKVAL": "1", "token": token},
-            headers={"Content-Type": "application/json; charset=utf-8"},
-            timeout=30,
-        )
-        health.record_response("allot_mufg", r.status_code, time.time() - t0, _retry_after(r))
-        if r.status_code in (429, 503):
-            raise AllotmentTransient(f"MUFG throttled (HTTP {r.status_code})")
-        if r.status_code != 200:
-            raise AllotmentTransient(f"MUFG search HTTP {r.status_code}")
-        root = ET.fromstring(r.json().get("d", "<NewDataSet />"))
-        for t in root.findall("Table1"):
-            msg = (t.findtext("Msg") or "").strip()
-            if msg:
-                health.record("allot_mufg", ok=True, latency=time.time() - t0, neutral=True)
-                return {"source": "mufg", "found": False, "note": msg or "no record"}
-        records = []
-        for t in root.findall("Table"):
-            applied = _num(t.findtext("SHARES"))
-            allotted = _num(t.findtext("ALLOT"))
-            records.append(
-                {
-                    "appln_no": (t.findtext("PEMNDG") or "").strip() or None,
-                    "name": (t.findtext("NAME1") or "").strip() or None,
-                    "applied": applied,
-                    "allotted": allotted,
-                    "price": (t.findtext("offer_price") or "").strip() or None,
-                    "amount_adj": (t.findtext("AMTADJ") or "").strip() or None,
-                    "refund": (t.findtext("RFNDAMT") or "").strip() or None,
-                }
+    own_session = session is None
+    last_exc: Exception | None = None
+    for attempt in range(2):
+        try:
+            s = session if session is not None else requests.Session()
+            if own_session:
+                s.headers.update({"User-Agent": MUFG_UA, "Referer": MUFG_BASE + "public-issues.html"})
+                s.get(MUFG_BASE + "public-issues.html", timeout=20)
+            token = _mufg_token(s)
+            r = s.post(
+                MUFG_BASE + "IPO.aspx/SearchOnPan",
+                json={"clientid": company_id, "PAN": pan, "IFSC": "", "CHKVAL": "1", "token": token},
+                headers={"Content-Type": "application/json; charset=utf-8"},
+                timeout=30,
             )
-        health.record("allot_mufg", ok=True, latency=time.time() - t0, neutral=not records)
-        if not records:
-            return {"source": "mufg", "found": False, "note": "no record"}
-        return {"source": "mufg", "found": True, "company": company_name, "records": records}
-    except (AllotmentTransient, AllotmentError):
-        raise
-    except Exception as exc:
-        health.record("allot_mufg", ok=False, latency=time.time() - t0, error=exc)
-        raise AllotmentTransient(f"MUFG search failed: {exc}") from exc
+            health.record_response("allot_mufg", r.status_code, time.time() - t0, _retry_after(r))
+            if r.status_code in (429, 503):
+                raise AllotmentTransient(f"MUFG throttled (HTTP {r.status_code})")
+            if r.status_code != 200:
+                raise AllotmentTransient(f"MUFG search HTTP {r.status_code}")
+            root = ET.fromstring(r.json().get("d", "<NewDataSet />"))
+            for t in root.findall("Table1"):
+                msg = (t.findtext("Msg") or "").strip()
+                if msg:
+                    health.record("allot_mufg", ok=True, latency=time.time() - t0, neutral=True)
+                    return {"source": "mufg", "found": False, "note": msg or "no record"}
+            records = []
+            for t in root.findall("Table"):
+                applied = _num(t.findtext("SHARES"))
+                allotted = _num(t.findtext("ALLOT"))
+                records.append(
+                    {
+                        "appln_no": (t.findtext("PEMNDG") or "").strip() or None,
+                        "name": (t.findtext("NAME1") or "").strip() or None,
+                        "applied": applied,
+                        "allotted": allotted,
+                        "price": (t.findtext("offer_price") or "").strip() or None,
+                        "amount_adj": (t.findtext("AMTADJ") or "").strip() or None,
+                        "refund": (t.findtext("RFNDAMT") or "").strip() or None,
+                    }
+                )
+            health.record("allot_mufg", ok=True, latency=time.time() - t0, neutral=not records)
+            if not records:
+                return {"source": "mufg", "found": False, "note": "no record"}
+            return {"source": "mufg", "found": True, "company": company_name, "records": records}
+        except AllotmentTransient as exc:
+            # throttle responses must NOT be retried — respect their backoff
+            if _is_throttle_message(str(exc)) or attempt == 1:
+                raise
+            last_exc = exc
+            time.sleep(2)
+        except Exception as exc:
+            if attempt == 1:
+                health.record("allot_mufg", ok=False, latency=time.time() - t0, error=exc)
+                raise AllotmentTransient(f"MUFG search failed: {exc}") from exc
+            last_exc = exc
+            time.sleep(2)
+    health.record("allot_mufg", ok=False, latency=time.time() - t0, error=last_exc)
+    raise AllotmentTransient(f"MUFG search failed after retry: {last_exc}") from last_exc
 
 
 # ---------------------------------------------------------------------------
@@ -424,8 +529,9 @@ def kfin_check(pan: str) -> dict:
     _pace("allot_kfin", gap=2.0)
     t0 = time.time()
     try:
-        # one retry on gateway wobbles (their own page retries 429/5xx too);
-        # anything persistent becomes a transient error for the caller.
+        # One retry on gateway wobbles (their own page retries 429/5xx too).
+        # A 429 is honored once (capped wait) instead of hammered; anything
+        # persistent becomes a transient error for the caller.
         r = None
         for attempt in range(2):
             r = requests.get(
@@ -444,6 +550,10 @@ def kfin_check(pan: str) -> dict:
                 },
                 timeout=25,
             )
+            if r.status_code == 429 and attempt == 0:
+                wait = _retry_after(r)
+                time.sleep(min(wait, 15.0) if wait else 5.0)
+                continue
             if r.status_code not in (502, 503, 504) or attempt == 1:
                 break
             time.sleep(3)

@@ -6,7 +6,7 @@ import {
   ResponsiveContainer,
   Tooltip,
 } from "recharts";
-import { fetchCurrentIpos, fetchGmp, fetchGmpTrends, fetchPastIpos, fetchSourceHealth, normIpoName, type GmpTrendSeries } from "../api";
+import { fetchCurrentIpos, fetchGmp, fetchGmpTrends, fetchPastIpos, fetchSourceHealth, lookupNormMap, normIpoName, type GmpTrendSeries } from "../api";
 
 function Spark({ series, up }: { series: GmpTrendSeries; up: boolean }) {
   const pts = series.points.slice(-24);
@@ -120,7 +120,7 @@ function parseEstimatedListing(gmpStr?: string | null, priceStr?: string | null)
 export function GmpPage() {
   const [search, setSearch] = useState("");
   const [view, setView] = useState<"trends" | "table">("trends");
-  const [status, setStatus] = useState<"All" | "Open" | "Upcoming" | "Closed" | "Listed">("All");
+  const [status, setStatus] = useState<"All" | "Open" | "Upcoming" | "Closed" | "Allotted" | "Listed">("All");
   const [sort, setSort] = useState<"gmp" | "momentum" | "name">("gmp");
   const trendsQ = useQuery({ queryKey: ["gmp-trends"], queryFn: fetchGmpTrends });
   const tableQ = useQuery({ queryKey: ["gmp"], queryFn: fetchGmp });
@@ -162,7 +162,7 @@ export function GmpPage() {
     return s ? rows.filter((r) => (r.name ?? "").toLowerCase().includes(s)) : rows;
   }, [tableQ.data, search]);
 
-  const GROUP_ORDER = ["Open", "Upcoming", "Closed", "Listed"];
+  const GROUP_ORDER = ["Open", "Upcoming", "Closed", "Allotted", "Listed"];
   const groups = useMemo(() => {
     const byStatus = new Map<string, typeof filtered>();
     for (const s of filtered) {
@@ -212,7 +212,7 @@ export function GmpPage() {
         />
 
         <div className="mb-3 flex flex-wrap items-center gap-1.5">
-          {(["All", "Open", "Upcoming", "Closed", "Listed"] as const).map((st) => (
+          {(["All", "Open", "Upcoming", "Closed", "Allotted", "Listed"] as const).map((st) => (
             <button
               key={st}
               type="button"
@@ -280,7 +280,7 @@ export function GmpPage() {
                       {g.items.map((s) => {
                         const up = s.trend === "up";
                         const delta = s.current != null && s.first != null ? s.current - s.first : null;
-                        const demand = demandMap.get(normIpoName(s.name));
+                        const demand = lookupNormMap(demandMap, s.name);
                         return (
                           <div
                             key={s.name}
@@ -362,7 +362,7 @@ export function GmpPage() {
                               <td className="py-2 pr-4 font-medium">{r.name ?? "—"}</td>
                               {cols.map((c) => {
                                 if (c.key === "demand") {
-                                  const d = demandMap.get(normIpoName(r.name));
+                                  const d = lookupNormMap(demandMap, r.name);
                                   return (
                                     <td key={c.key} className="py-2 pr-4" title={d ? (d.live ? "Live NSE subscription" : "Last recorded subscription") : "No demand data for this issue"}>
                                       {d ? (

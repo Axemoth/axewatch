@@ -47,3 +47,9 @@ venv/
 Thumbs.db
 .vscode/
 *.log
+
+# local-only: Windows one-click launcher (points at this machine's paths)
+# and unrelated scratch work — never publish these
+/start-axewatch.bat
+/stop-axewatch.bat
+/astound-prep/

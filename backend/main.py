@@ -1366,7 +1366,7 @@ def _parse_allot_date(s: str | None) -> float | None:
         return None
     from datetime import datetime
 
-    for fmt in ("%d-%b-%Y", "%d-%B-%Y", "%d-%m-%Y", "%Y-%m-%d", "%d %b %Y"):
+    for fmt in ("%d-%b-%Y", "%d-%B-%Y", "%d-%m-%Y", "%Y-%m-%d", "%d %b %Y", "%d %B %Y"):
         try:
             return datetime.strptime(s.strip(), fmt).timestamp()
         except (ValueError, TypeError):
@@ -1447,6 +1447,14 @@ def _allotment_candidates(allow_live: bool = True) -> list[dict]:
             issue.get("name") or issue.get("symbol"), directory)
         issue["registrar"] = (hit or {}).get("registrar")
         issue["registrar_name"] = (hit or {}).get("name")
+        # Declared allotment dates beat the close+5 estimate wherever the
+        # directory knows them.
+        if (hit or {}).get("allotment_date"):
+            ts = _parse_allot_date(hit["allotment_date"])
+            if ts:
+                from datetime import datetime
+
+                issue["expected_allotment"] = datetime.fromtimestamp(ts).strftime("%d-%b-%Y")
     return out
 
 
@@ -1601,6 +1609,7 @@ def _check_pan_issues(pan_id: int, pan: str, issues: list[dict]) -> list[dict]:
     mufg_down = not _health.is_available("allot_mufg") and not mufg_cos
     mem_ids = allot_fetcher.remembered_mufg_ids()
     mufg_calls = 0
+    mufg_session = None  # one warmed session shared by all MUFG lookups in this run
     bigshare_mem_ids = allot_fetcher.remembered_bigshare_ids()
 
     def mufg_target_for(issue: dict) -> dict | None:
@@ -1645,8 +1654,12 @@ def _check_pan_issues(pan_id: int, pan: str, issues: list[dict]) -> list[dict]:
         if target and mufg_calls < MUFG_CALL_CAP:
             mufg_calls += 1
             try:
-                res = allot_fetcher.mufg_check(pan, target["id"], target["name"])
+                if mufg_session is None:
+                    mufg_session = allot_fetcher.mufg_session()
+                res = allot_fetcher.mufg_check(pan, target["id"], target["name"],
+                                               session=mufg_session)
             except allot_fetcher.AllotmentTransient as exc:
+                mufg_session = None  # stale session may be the cause; next lookup rewarms
                 rows.append(_store_allot_row(pan_id, issue, "mufg", "error",
                                              error=str(exc)[:160]))
             else:
