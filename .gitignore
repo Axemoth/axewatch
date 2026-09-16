@@ -48,6 +48,10 @@ Thumbs.db
 .vscode/
 *.log
 
+# Axewatch-app lives here as a SEPARATE repo (own .git, own remote).
+# Ignored so the two histories never touch each other.
+Axewatch-app/
+
 # local-only: Windows one-click launcher (points at this machine's paths)
 # and unrelated scratch work — never publish these
 /start-axewatch.bat
