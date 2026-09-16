@@ -174,6 +174,7 @@ def directory_if_warm() -> dict | None:
 
 
 _IPOMARKET_URL = "https://ipomarket.in/allotment"
+_IPOWATCH_ALLOT_URL = "https://ipowatch.in/ipo-allotment-status-how-to-check/"
 
 
 def _ipomarket_registrar_key(text: str) -> str | None:
@@ -238,13 +239,100 @@ def _bigshare_companies(url: str) -> list[dict]:
     return out
 
 
+def _merge_directory_entries(directory: dict, entries: list[dict]) -> None:
+    """Fill missing keys and backfill missing allotment dates. Existing
+    authoritative entries (MUFG API, Bigshare dropdowns) are never replaced."""
+    for e in entries:
+        key = canon_ipo_name(e.get("name"))
+        if not key or not e.get("registrar"):
+            continue
+        if key not in directory:
+            directory[key] = {"registrar": e["registrar"], "name": e["name"]}
+            if e.get("allotment_date"):
+                directory[key]["allotment_date"] = e["allotment_date"]
+        elif e.get("allotment_date") and not directory[key].get("allotment_date"):
+            directory[key]["allotment_date"] = e["allotment_date"]
+
+
+def _registrar_key_from_href(url: str) -> str | None:
+    u = (url or "").lower()
+    if "bigshareonline.com" in u:
+        return "bigshare"
+    if "kfintech.com" in u:
+        return "kfin"
+    if "mpms.mufg.com" in u or "linkintime" in u:
+        return "mufg"
+    if "maashitla.com" in u:
+        return "maashitla"
+    if "purvashare.com" in u:
+        return "purva"
+    if "skylinerta.com" in u:
+        return "skyline"
+    if "cameoindia.com" in u:
+        return "cameo"
+    if "beetalfinancial.com" in u:
+        return "beetal"
+    return None
+
+
+def _ipowatch_allotments() -> list[dict]:
+    """[(name, allotment_date, registrar)] from IPOWatch's allotment tables.
+
+    Independent second source for the same mapping (covers issues ipomarket
+    misses, including not-yet-closed ones). Registrar comes from the status
+    column's link target, falling back to its text.
+    """
+    import html as _html
+
+    r = requests.get(_IPOWATCH_ALLOT_URL, headers={"User-Agent": MUFG_UA}, timeout=15)
+    r.raise_for_status()
+    r.encoding = "utf-8"
+    return _parse_ipowatch_tables(r.text)
+
+
+def _parse_ipowatch_tables(html_text: str) -> list[dict]:
+    """Pure parser (offline-testable): allotment tables only, never GMP-style
+    lookalikes."""
+    import html as _html
+
+    out = []
+    for table in re.findall(r"<table[^>]*>(.*?)</table>", html_text, re.S | re.I):
+        rows = re.findall(r"<tr[^>]*>(.*?)</tr>", table, re.S | re.I)
+        if not rows:
+            continue
+        hdr = [re.sub(r"\s+", " ", re.sub(r"<[^>]+>", "", c)).strip().lower()
+               for c in re.findall(r"<t[dh][^>]*>(.*?)</t[dh]>", rows[0], re.S | re.I)]
+        # strict shape guard: only the allotment tables ([IPO, IPO Date,
+        # Allotment Date, Allotment Status]). A loose check once admitted an
+        # "IPO GMP"-style table and mapped junk ("NSE" -> mufg).
+        if len(hdr) < 4 or hdr[0] != "ipo" or "allot" not in hdr[2]:
+            continue
+        for row in rows[1:]:
+            cells = re.findall(r"<t[dh][^>]*>(.*?)</t[dh]>", row, re.S | re.I)
+            if len(cells) < 4:
+                continue
+            name = re.sub(r"\s+", " ", _html.unescape(re.sub(r"<[^>]+>", "", cells[0]))).strip()
+            date = re.sub(r"\s+", " ", _html.unescape(re.sub(r"<[^>]+>", "", cells[2]))).strip()
+            status_html = cells[3]
+            hrefs = re.findall(r'href="([^"]+)"', status_html)
+            key = next((_registrar_key_from_href(h) for h in hrefs
+                        if _registrar_key_from_href(h)), None)
+            if key is None:
+                status_text = re.sub(r"\s+", " ", _html.unescape(
+                    re.sub(r"<[^>]+>", "", status_html))).strip()
+                key = _ipomarket_registrar_key(status_text)
+            if name and key:
+                out.append({"name": name, "allotment_date": date or None, "registrar": key})
+    return out
+
+
 def registrar_directory(force: bool = False) -> dict:
     """canon_name -> {"registrar", "name", "allotment_date"?}.
 
     MUFG from their live company API and Bigshare from the public dropdowns
-    are authoritative; ipomarket's allotment tables fill the rest (notably
-    KFintech and the smaller SME registrars, which publish no company list)
-    and backfill declared allotment dates. Cached 24h; individual source
+    are authoritative; ipomarket and IPOWatch allotment tables fill the rest
+    (notably KFintech and the smaller SME registrars, which publish no company
+    list) and backfill declared allotment dates. Cached 24h; individual source
     failures are tolerated (attribution just gets sparser, checks still run).
     """
     global _REGDIR
@@ -276,19 +364,19 @@ def registrar_directory(force: bool = False) -> dict:
     try:
         _pace("allot_regdir", gap=1.0)
         t0 = time.time()
-        for e in _ipomarket_allotments():
-            key = canon_ipo_name(e["name"])
-            if not key:
-                continue
-            if key not in directory:
-                directory[key] = {"registrar": e["registrar"], "name": e["name"],
-                                  "allotment_date": e["allotment_date"]}
-            elif e["allotment_date"] and not directory[key].get("allotment_date"):
-                directory[key]["allotment_date"] = e["allotment_date"]
+        _merge_directory_entries(directory, _ipomarket_allotments())
         health.record("allot_regdir", ok=True, latency=time.time() - t0)
     except Exception as exc:
         health.record("allot_regdir", ok=False, latency=0.0, error=exc)
         logger.warning("registrar directory ipomarket failed: %s", exc)
+    try:
+        _pace("allot_regdir", gap=1.0)
+        t0 = time.time()
+        _merge_directory_entries(directory, _ipowatch_allotments())
+        health.record("allot_regdir", ok=True, latency=time.time() - t0)
+    except Exception as exc:
+        health.record("allot_regdir", ok=False, latency=0.0, error=exc)
+        logger.warning("registrar directory ipowatch failed: %s", exc)
     # Do not turn a temporary upstream outage into a 24-hour blind spot.  An
     # empty directory means neither live source could be read, so let the next
     # request try again; a partial directory is still useful and is cached.
