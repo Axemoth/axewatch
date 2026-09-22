@@ -55,8 +55,31 @@ function RegistrarChip({ registrar, size = "md" }: { registrar: string | null; s
       title="Registrar not mapped yet — MUFG + KFintech still attempt automatically"
       className={`shrink-0 rounded-full border border-dashed border-zinc-300 font-bold uppercase text-zinc-400 ${cls} dark:border-zinc-700 dark:text-zinc-500`}
     >
-      registrar ?
+      {registrar ? registrar.toUpperCase() : "registrar ?"}
     </span>
+  );
+}
+
+function AllotRegistrarStrip({ byReg, total }: { byReg: Record<string, number>; total: number }) {
+  const entries = Object.entries(byReg).sort((a, b) => b[1] - a[1]);
+  if (entries.length === 0) return null;
+  return (
+    <div className="flex flex-wrap items-center gap-x-4 gap-y-1.5 rounded-2xl border border-zinc-200 bg-white px-4 py-2.5 dark:border-zinc-800 dark:bg-zinc-900/60">
+      <span className="text-[11px] font-bold uppercase tracking-wider text-zinc-500">
+        Registrars
+      </span>
+      <span className="tnum text-xs text-zinc-500">{total} issues mapped</span>
+      {entries.map(([code, n]) => (
+        <span
+          key={code}
+          title={`${n} issue${n === 1 ? "" : "s"} handled by ${code.toUpperCase()}`}
+          className="tnum inline-flex cursor-help items-center gap-1.5 text-xs text-zinc-600 dark:text-zinc-300"
+        >
+          <RegistrarChip registrar={code} size="sm" />
+          <span className="text-[11px] text-zinc-500">{n}</span>
+        </span>
+      ))}
+    </div>
   );
 }
 
@@ -116,9 +139,11 @@ function AllotHealthStrip() {
 // individually when needed.
 const RECENT_CLOSE_DAYS = 14;
 
-function closeAgeDays(close: string | null): number | null {
-  if (!close) return null;
-  const m = close.trim().match(/^(\d{1,2})-([A-Za-z]{3,9})-(\d{2,4})$/);
+function parseDmY(date: string | null): number | null {
+  if (!date) return null;
+  const t = Date.parse(date);
+  if (Number.isFinite(t)) return t;
+  const m = date.trim().match(/^(\d{1,2})-([A-Za-z]{3,9})-(\d{2,4})$/);
   if (!m) return null;
   const months: Record<string, number> = {
     jan: 0, feb: 1, mar: 2, apr: 3, may: 4, jun: 5,
@@ -129,8 +154,44 @@ function closeAgeDays(close: string | null): number | null {
   let year = parseInt(m[3], 10);
   if (year < 100) year += 2000;
   const ts = new Date(year, mi, parseInt(m[1], 10)).getTime();
-  if (!Number.isFinite(ts)) return null;
+  return Number.isFinite(ts) ? ts : null;
+}
+
+function closeAgeDays(close: string | null): number | null {
+  const ts = parseDmY(close);
+  if (ts == null) return null;
   return (Date.now() - ts) / 86400000;
+}
+
+/** Declared allotment date has passed (end of that day) — results should be out. */
+function declaredOut(expected: string | null): boolean {
+  const ts = parseDmY(expected);
+  if (ts == null) return false;
+  return Date.now() >= ts + 86400000;
+}
+
+// Tracker-style lifecycle groups (Narada: Upcoming / Open / Closed / Allotted / Listed).
+type LifeGroup = "upcoming" | "open" | "allotment_out" | "closed" | "older";
+
+const LIFE_META: { key: LifeGroup; title: string; hint: string }[] = [
+  { key: "upcoming", title: "Upcoming", hint: "Opens soon — no allotment to find yet" },
+  { key: "open", title: "Open now", hint: "Bidding live — allotment comes after close" },
+  { key: "allotment_out", title: "Allotment out", hint: "Declared date reached or a saved result confirms it" },
+  { key: "closed", title: "Closed — awaiting allotment", hint: "Bids in, registrar still finalizing" },
+  { key: "older", title: "Older / likely listed", hint: "Long final — registrar pages may have rotated off" },
+];
+
+function issueLife(iss: AllotIssue, decided: Set<string>): LifeGroup {
+  if (iss.state === "active") {
+    const t = parseDmY(iss.open_date);
+    if (t != null && t - Date.now() > 86400000) return "upcoming";
+    return "open";
+  }
+  if (decided.has(iss.key)) return "allotment_out";
+  const age = closeAgeDays(iss.close_date);
+  if (age != null && age > 30) return "older";
+  if (declaredOut(iss.expected_allotment)) return "allotment_out";
+  return "closed";
 }
 
 function defaultSelectedIssues(issues: AllotIssue[]): Set<string> {
@@ -310,6 +371,11 @@ function ResultRow({
   const [open, setOpen] = useState(false);
   const needsManual = result.overall !== "allotted" && result.registrar === "bigshare";
   const manualRow = result.sources.find((s) => s.source === "manual");
+  const resultsOut =
+    result.overall === "allotted" ||
+    result.overall === "not_allotted" ||
+    result.sources.some((s) => s.source === "manual") ||
+    declaredOut(result.expected_allotment);
   const accent =
     result.overall === "allotted"
       ? "border-l-4 border-l-emerald-500"
@@ -339,6 +405,14 @@ function ResultRow({
           </span>
         </button>
         <StatusBadge result={result} />
+        {resultsOut && (
+          <span
+            title="Allotment declared for this issue — declared date reached or a saved result confirms it"
+            className="shrink-0 rounded-full bg-emerald-600/15 px-2 py-0.5 text-[10px] font-bold uppercase text-emerald-700 dark:text-emerald-300"
+          >
+            Results out
+          </span>
+        )}
         {checkable && (
           <button
             type="button"
@@ -530,6 +604,44 @@ export function AllotmentPage() {
   const shownByPan = liveByPan ?? cachedByPan;
   const issueKeys = useMemo(() => new Set(issues.map((i) => i.key)), [issues]);
 
+  // Issues with a decisive saved outcome (registrar answer or hand-logged result).
+  const decidedKeys = useMemo(() => {
+    const s = new Set<string>();
+    for (const r of [...(resultsQ.data?.data.results ?? []), ...(job?.results ?? [])]) {
+      if (
+        r.overall === "allotted" ||
+        r.overall === "not_allotted" ||
+        r.sources.some((x) => x.source === "manual")
+      )
+        s.add(r.issue_key);
+    }
+    return s;
+  }, [resultsQ.data, job]);
+
+  const groupedIssues = useMemo(() => {
+    const buckets = new Map<LifeGroup, AllotIssue[]>();
+    for (const iss of issues) {
+      const g = issueLife(iss, decidedKeys);
+      if (!buckets.has(g)) buckets.set(g, []);
+      buckets.get(g)!.push(iss);
+    }
+    return LIFE_META.filter((m) => (buckets.get(m.key) ?? []).length > 0).map((m) => ({
+      ...m,
+      items: buckets.get(m.key)!,
+    }));
+  }, [issues, decidedKeys]);
+
+  const setGroup = (items: AllotIssue[], on: boolean) => {
+    setSelIssues((prev) => {
+      const next = new Set(prev ?? issues.map((i) => i.key));
+      for (const it of items) {
+        if (on) next.add(it.key);
+        else next.delete(it.key);
+      }
+      return next;
+    });
+  };
+
   const toggle = <T,>(set: Set<T> | null, v: T, apply: (s: Set<T>) => void) => {
     const next = new Set<T>(set ?? []);
     if (next.has(v)) next.delete(v);
@@ -659,45 +771,79 @@ export function AllotmentPage() {
             )}
           </div>
           <p className="mb-3 text-xs leading-relaxed text-zinc-500 dark:text-zinc-400">
-            Recently closed issues are preselected — active bids have no allotment to find yet,
-            and older ones are long final. Tick anything else in for a one-off check.
+            Grouped like a tracker — upcoming, open, allotment-out, closed, older. Recently
+            closed issues are preselected; tick anything else in for a one-off check.
           </p>
           {issuesQ.isLoading || !issuesQ.data ? (
             <TableSkeleton rows={4} cols={2} />
           ) : issues.length === 0 ? (
             <EmptyState title="No checkable issues" hint="The backend is still warming up its issue list — try again in a minute." />
           ) : (
-            <ul className="nice-scroll max-h-64 space-y-1.5 overflow-auto pr-1">
-              {issues.map((iss) => (
-                <li key={iss.key}>
-                  <label className="flex cursor-pointer items-center gap-2 rounded-xl bg-zinc-50 px-3 py-2 ring-1 ring-zinc-200/70 transition-colors hover:ring-emerald-500/30 dark:bg-zinc-950/60 dark:ring-zinc-800/60">
-                    <input
-                      type="checkbox"
-                      checked={selIssues?.has(iss.key) ?? true}
-                      onChange={() => selIssues && toggle(selIssues, iss.key, setSelIssues)}
-                      className="h-4 w-4 shrink-0 accent-emerald-500"
-                    />
-                    <span className="min-w-0 flex-1">
-                      <span className="block truncate text-sm font-medium">{iss.name ?? iss.symbol}</span>
-                      <span className="tnum text-[11px] text-zinc-500">
-                        {iss.state === "active" ? "bidding open" : iss.close_date ? `closed ${iss.close_date}` : "recent"}
-                        {iss.expected_allotment ? ` · allotment ~${iss.expected_allotment}` : ""}
+            <div className="nice-scroll max-h-72 space-y-3 overflow-auto pr-1">
+              {groupedIssues.map((g) => {
+                const selCount = g.items.filter((i) => selIssues?.has(i.key) ?? true).length;
+                const allSel = selCount === g.items.length;
+                return (
+                  <div key={g.key}>
+                    <div className="mb-1 flex items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={() => setGroup(g.items, !allSel)}
+                        title={allSel ? `Deselect all ${g.title}` : `Select all ${g.title}`}
+                        className="rounded px-1 text-[11px] font-bold uppercase tracking-wider text-zinc-500 hover:text-emerald-500"
+                      >
+                        {g.title} · {g.items.length}
+                      </button>
+                      <span className="tnum text-[11px] text-zinc-400" title={g.hint}>
+                        {selCount}/{g.items.length} selected
                       </span>
-                    </span>
-                    <span
-                      className={`shrink-0 rounded-full px-2 py-0.5 text-[10px] font-bold uppercase ${
-                        iss.state === "active"
-                          ? "bg-emerald-500/10 text-emerald-600 dark:text-emerald-400"
-                          : "bg-sky-500/10 text-sky-600 dark:text-sky-400"
-                      }`}
-                    >
-                      {iss.state}
-                    </span>
-                    <RegistrarChip registrar={iss.registrar} />
-                  </label>
-                </li>
-              ))}
-            </ul>
+                    </div>
+                    <ul className="space-y-1.5">
+                      {g.items.map((iss) => {
+                        const life = issueLife(iss, decidedKeys);
+                        return (
+                          <li key={iss.key}>
+                            <label className="flex cursor-pointer items-center gap-2 rounded-xl bg-zinc-50 px-3 py-2 ring-1 ring-zinc-200/70 transition-colors hover:ring-emerald-500/30 dark:bg-zinc-950/60 dark:ring-zinc-800/60">
+                              <input
+                                type="checkbox"
+                                checked={selIssues?.has(iss.key) ?? true}
+                                onChange={() => selIssues && toggle(selIssues, iss.key, setSelIssues)}
+                                className="h-4 w-4 shrink-0 accent-emerald-500"
+                              />
+                              <span className="min-w-0 flex-1">
+                                <span className="block truncate text-sm font-medium">{iss.name ?? iss.symbol}</span>
+                                <span className="tnum text-[11px] text-zinc-500">
+                                  {iss.state === "active" ? "bidding open" : iss.close_date ? `closed ${iss.close_date}` : "recent"}
+                                  {iss.expected_allotment ? ` · allotment ~${iss.expected_allotment}` : ""}
+                                </span>
+                              </span>
+                              {life === "allotment_out" && (
+                                <span
+                                  title="Declared allotment date reached or a saved result confirms it"
+                                  className="shrink-0 rounded-full bg-emerald-600/15 px-2 py-0.5 text-[10px] font-bold uppercase text-emerald-700 dark:text-emerald-300"
+                                >
+                                  Results out
+                                </span>
+                              )}
+                              <span
+                                className={`shrink-0 rounded-full px-2 py-0.5 text-[10px] font-bold uppercase ${
+                                  iss.state === "active"
+                                    ? "bg-emerald-500/10 text-emerald-600 dark:text-emerald-400"
+                                    : "bg-sky-500/10 text-sky-600 dark:text-sky-400"
+                                }`}
+                              >
+                                {iss.state}
+                              </span>
+                              <RegistrarChip registrar={iss.registrar} />
+                            </label>
+                          </li>
+                        );
+                      })}
+                    </ul>
+                  </div>
+                );
+              })}
+            </div>
           )}
         </section>
       </div>
@@ -736,6 +882,8 @@ export function AllotmentPage() {
       </section>
 
       <AllotHealthStrip />
+
+      <AllotRegistrarStrip byReg={regQ.data?.data.by_registrar ?? {}} total={regCount} />
 
       {(liveByPan && liveByPan.size > 0) || (cachedByPan.size > 0) ? (
         <div className="space-y-4">
